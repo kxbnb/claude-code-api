@@ -233,8 +233,9 @@ export class CliBridge extends EventEmitter<BridgeEvents> {
 
     const env: Record<string, string | undefined> = {
       ...process.env,
-      CLAUDECODE: "1",
     };
+    // Remove CLAUDECODE to avoid "nested session" detection
+    delete env.CLAUDECODE;
     if (managed.apiKey) {
       env.ANTHROPIC_API_KEY = managed.apiKey;
     }
