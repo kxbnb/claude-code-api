@@ -1,5 +1,4 @@
 import { Hono } from "hono";
-import { stream as honoStream } from "hono/streaming";
 import type { CliBridge } from "../session/cli-bridge.js";
 import type { SessionPool } from "../session/pool.js";
 import type {
@@ -135,112 +134,121 @@ async function handleNonStreaming(
   });
 }
 
-async function handleStreaming(
-  c: any,
+function handleStreaming(
+  _c: any,
   bridge: CliBridge,
   sessionId: string,
   content: string,
   model: string,
 ) {
-  c.header("x-session-id", sessionId);
-  c.header("Content-Type", "text/event-stream");
-  c.header("Cache-Control", "no-cache");
-  c.header("Connection", "keep-alive");
+  const encoder = new TextEncoder();
 
-  return honoStream(c, async (stream) => {
-    let blockIndex = 0;
-    let sentMessageStart = false;
+  const readable = new ReadableStream({
+    start(controller) {
+      let blockIndex = 0;
+      let sentMessageStart = false;
 
-    const onAssistant = (sid: string, msg: CLIAssistantMessage) => {
-      if (sid !== sessionId) return;
+      const enqueue = (s: string) => {
+        try { controller.enqueue(encoder.encode(s)); } catch {}
+      };
 
-      if (!sentMessageStart) {
-        stream.write(sseMessageStart(msg.message.model || model, msg.message.id));
-        sentMessageStart = true;
-      }
+      const onAssistant = (sid: string, msg: CLIAssistantMessage) => {
+        if (sid !== sessionId) return;
 
-      for (const block of msg.message.content) {
-        if (block.type === "text") {
-          stream.write(sseContentBlockStart(blockIndex, { type: "text", text: "" }));
-          stream.write(sseContentBlockDelta(blockIndex, block.text));
-          stream.write(sseContentBlockStop(blockIndex));
-          blockIndex++;
-        } else if (block.type === "tool_use") {
-          stream.write(sseContentBlockStart(blockIndex, block));
-          stream.write(sseContentBlockStop(blockIndex));
-          blockIndex++;
+        if (!sentMessageStart) {
+          enqueue(sseMessageStart(msg.message.model || model, msg.message.id));
+          sentMessageStart = true;
         }
-      }
-    };
 
-    const onStreamEvent = (sid: string, msg: CLIStreamEventMessage) => {
-      if (sid !== sessionId) return;
-
-      if (!sentMessageStart) {
-        stream.write(sseMessageStart(model));
-        sentMessageStart = true;
-      }
-
-      const event = msg.event as any;
-      if (event?.type === "content_block_start") {
-        stream.write(sseContentBlockStart(event.index ?? blockIndex, event.content_block));
-        blockIndex = (event.index ?? blockIndex) + 1;
-      } else if (event?.type === "content_block_delta") {
-        if (event.delta?.type === "text_delta") {
-          stream.write(sseContentBlockDelta(event.index ?? blockIndex - 1, event.delta.text));
+        for (const block of msg.message.content) {
+          if (block.type === "text") {
+            enqueue(sseContentBlockStart(blockIndex, { type: "text", text: "" }));
+            enqueue(sseContentBlockDelta(blockIndex, block.text));
+            enqueue(sseContentBlockStop(blockIndex));
+            blockIndex++;
+          } else if (block.type === "tool_use") {
+            enqueue(sseContentBlockStart(blockIndex, block));
+            enqueue(sseContentBlockStop(blockIndex));
+            blockIndex++;
+          }
         }
-      } else if (event?.type === "content_block_stop") {
-        stream.write(sseContentBlockStop(event.index ?? blockIndex - 1));
+      };
+
+      const onStreamEvent = (sid: string, msg: CLIStreamEventMessage) => {
+        if (sid !== sessionId) return;
+
+        if (!sentMessageStart) {
+          enqueue(sseMessageStart(model));
+          sentMessageStart = true;
+        }
+
+        const event = msg.event as any;
+        if (event?.type === "content_block_start") {
+          enqueue(sseContentBlockStart(event.index ?? blockIndex, event.content_block));
+          blockIndex = (event.index ?? blockIndex) + 1;
+        } else if (event?.type === "content_block_delta") {
+          if (event.delta?.type === "text_delta") {
+            enqueue(sseContentBlockDelta(event.index ?? blockIndex - 1, event.delta.text));
+          }
+        } else if (event?.type === "content_block_stop") {
+          enqueue(sseContentBlockStop(event.index ?? blockIndex - 1));
+        }
+      };
+
+      const onResult = (sid: string, msg: CLIResultMessage) => {
+        if (sid !== sessionId) return;
+        cleanup();
+
+        if (sentMessageStart) {
+          enqueue(sseMessageDelta(msg.stop_reason || "end_turn", msg.usage.output_tokens));
+          enqueue(sseMessageStop());
+        }
+        try { controller.close(); } catch {}
+      };
+
+      const onError = (sid: string, _err: Error) => {
+        if (sid !== sessionId) return;
+        cleanup();
+        try { controller.close(); } catch {}
+      };
+
+      const onExit = (sid: string, _code: number | null) => {
+        if (sid !== sessionId) return;
+        cleanup();
+        try { controller.close(); } catch {}
+      };
+
+      function cleanup() {
+        clearTimeout(timer);
+        bridge.removeListener("assistant", onAssistant);
+        bridge.removeListener("stream_event", onStreamEvent);
+        bridge.removeListener("result", onResult);
+        bridge.removeListener("error", onError);
+        bridge.removeListener("exit", onExit);
       }
-    };
 
-    const onResult = (sid: string, msg: CLIResultMessage) => {
-      if (sid !== sessionId) return;
-      cleanup();
+      bridge.on("assistant", onAssistant);
+      bridge.on("stream_event", onStreamEvent);
+      bridge.on("result", onResult);
+      bridge.on("error", onError);
+      bridge.on("exit", onExit);
 
-      if (sentMessageStart) {
-        stream.write(sseMessageDelta(
-          msg.stop_reason || "end_turn",
-          msg.usage.output_tokens,
-        ));
-        stream.write(sseMessageStop());
-      }
-      stream.close();
-    };
+      enqueue(ssePing());
+      bridge.sendUserMessage(sessionId, content);
 
-    const onError = (sid: string, _err: Error) => {
-      if (sid !== sessionId) return;
-      cleanup();
-      stream.close();
-    };
+      const timer = setTimeout(() => {
+        cleanup();
+        try { controller.close(); } catch {}
+      }, 5 * 60 * 1000);
+    },
+  });
 
-    const onExit = (sid: string, _code: number | null) => {
-      if (sid !== sessionId) return;
-      cleanup();
-      stream.close();
-    };
-
-    function cleanup() {
-      bridge.removeListener("assistant", onAssistant);
-      bridge.removeListener("stream_event", onStreamEvent);
-      bridge.removeListener("result", onResult);
-      bridge.removeListener("error", onError);
-      bridge.removeListener("exit", onExit);
-    }
-
-    bridge.on("assistant", onAssistant);
-    bridge.on("stream_event", onStreamEvent);
-    bridge.on("result", onResult);
-    bridge.on("error", onError);
-    bridge.on("exit", onExit);
-
-    stream.write(ssePing());
-    bridge.sendUserMessage(sessionId, content);
-
-    // Timeout
-    setTimeout(() => {
-      cleanup();
-      stream.close();
-    }, 5 * 60 * 1000);
+  return new Response(readable, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Session-Id": sessionId,
+    },
   });
 }

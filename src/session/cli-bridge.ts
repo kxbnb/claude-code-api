@@ -76,8 +76,11 @@ export class CliBridge extends EventEmitter<BridgeEvents> {
     }
 
     managed.cliSocket = ws;
-    managed.info.state = "connected";
+    managed.info.state = "ready";
     console.log(`[cli-bridge] CLI connected for session ${sessionId}`);
+
+    // Resolve readyPromise on WebSocket connection (don't wait for system/init)
+    managed.readyResolve?.();
 
     // Flush queued messages
     for (const ndjson of managed.pendingMessages) {
@@ -114,9 +117,7 @@ export class CliBridge extends EventEmitter<BridgeEvents> {
         if ("subtype" in msg && msg.subtype === "init") {
           const initMsg = msg as CLISystemInitMessage;
           managed.info.cliSessionId = initMsg.session_id;
-          managed.info.state = "ready";
           this.emit("ready", sessionId, initMsg);
-          managed.readyResolve?.();
         }
         break;
 
@@ -271,7 +272,7 @@ export class CliBridge extends EventEmitter<BridgeEvents> {
     });
   }
 
-  async waitForReady(sessionId: string, timeoutMs = 30_000): Promise<void> {
+  async waitForReady(sessionId: string, timeoutMs = 60_000): Promise<void> {
     const managed = this.sessions.get(sessionId);
     if (!managed) throw new Error(`Session ${sessionId} not found`);
     if (managed.info.state === "ready") return;
