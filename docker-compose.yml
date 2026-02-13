@@ -1,0 +1,14 @@
+services:
+  ccc-api:
+    build: .
+    ports:
+      - "3457:3457"
+    environment:
+      - PORT=3457
+      - WS_PORT=3458
+      - SESSION_TIMEOUT_MS=1800000
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
+    volumes:
+      # Mount a working directory for Claude Code to operate on
+      - ./workspace:/workspace
+    working_dir: /workspace
